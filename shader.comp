@@ -1,0 +1,347 @@
+#version 430
+
+// -------------------------------------------
+// Data Structures
+// -------------------------------------------
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    int material;
+    vec3 color;
+    vec3 emission;
+    float emissionStrength;
+};
+
+struct Quad {
+    vec3 point;
+    vec3 v1;
+    vec3 v2;
+    int material;
+    vec3 color;
+    vec3 emission;
+    float emissionStrength;
+};
+
+struct Triangle {
+    vec3 v0;
+    vec3 v1;
+    vec3 v2;
+    int material;
+    vec3 color;
+    vec3 emission;
+    float emissionStrength;
+};
+
+
+// -------------------------------------------
+// RNG (stolen from online) & Scattering Utilities (PCG-derived)
+// -------------------------------------------
+
+// PCG-based permuted congruential generator (found online)
+uint NextRandom(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint result = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    result = (result >> 22u) ^ result;
+    return result;
+}
+
+// Uniform [0,1] (also found online)
+float RandomValue(inout uint state) {
+    return float(NextRandom(state)) / 4294967295.0;
+}
+
+// Normal distribution (mean=0, sd=1) (also found online)
+float RandomValueNormalDistribution(inout uint state) {
+    float theta = 2.0 * 3.141592653589793 * RandomValue(state);
+    float rho   = sqrt(-2.0 * log(RandomValue(state)));
+    return rho * cos(theta);
+}
+
+// Random direction on unit sphere 
+vec3 RandomDirection(inout uint state) {
+    float x = RandomValueNormalDistribution(state);
+    float y = RandomValueNormalDistribution(state);
+    float z = RandomValueNormalDistribution(state);
+    return normalize(vec3(x, y, z));
+}
+
+// Random point in unit disk 
+vec2 RandomPointInCircle(inout uint state) {
+    float angle = RandomValue(state) * 2.0 * 3.141592653589793;
+    vec2 p = vec2(cos(angle), sin(angle));
+    return p * sqrt(RandomValue(state));
+}
+
+// Diffuse scattering: cosine-weighted hemisphere sample
+vec3 scatter_diffuse(vec3 normal, inout uint state) {
+    vec3 dir = RandomDirection(state);
+    if (dot(dir, normal) < 0.0) dir = -dir; // ensure dir is in the hemisphere
+    return normalize(normal + dir); // lambertian reflectance
+}
+
+// Specular reflection
+vec3 scatter_specular(vec3 normal, vec3 incident) {
+    return normalize(reflect(incident, normal));
+}
+
+// Schlick's approximation
+float schlick(float cosine, float ref_idx) {
+    float r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+}
+
+// Glass scatter: reflect vs refract
+// Similar to previous project in python code
+vec3 scatter_glass(vec3 normal, vec3 incident, float ior, inout uint state, out bool wasRefracted) {
+    vec3 unit_dir = normalize(incident);
+    float cos_theta = min(dot(-unit_dir, normal), 1.0);
+    float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+    bool front_face = dot(unit_dir, normal) < 0.0;
+    float eta = front_face ? (1.0/ior) : ior;
+    vec3 n = front_face ? normal : -normal;
+
+    bool cannot_refract = eta * sin_theta > 1.0;
+    float reflect_prob = schlick(cos_theta, eta);
+
+    if (cannot_refract || RandomValue(state) < reflect_prob) {
+        wasRefracted = false;
+        return reflect(unit_dir, n);
+    } else {
+        wasRefracted = true;
+        return refract(unit_dir, n, eta);
+    }
+}
+
+// ------------------------------------------
+// Geometry Intersection
+// ------------------------------------------
+
+
+bool hit_sphere(Sphere sphere, Ray ray, out vec3 normal, out float t) {
+    // ray-sphere intersection 
+    vec3 oc = ray.origin - sphere.center;
+    float a = dot(ray.direction, ray.direction);
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - sphere.radius * sphere.radius;
+    float disc = b*b - a*c;
+    if (disc < 0.0) return false;
+    float sqrt_d = sqrt(disc);
+    float root = (-b - sqrt_d) / a;
+    if (root < 0.001) {
+        root = (-b + sqrt_d) / a;
+        if (root < 0.001) return false;
+    }
+    t = root;
+    vec3 hitPt = ray.origin + t * ray.direction;
+    normal = normalize(hitPt - sphere.center);
+    return true;
+}
+
+bool intersectTriangle(Ray ray, vec3 v0, vec3 v1, vec3 v2, out float t, out vec3 normal) {
+    // ray-triangle intersection
+    const float EPS = 1e-6;
+    vec3 e1 = v1 - v0;
+    vec3 e2 = v2 - v0;
+    vec3 p = cross(ray.direction, e2);
+    float det = dot(e1, p);
+    if (abs(det) < EPS) return false;
+    float invDet = 1.0 / det;
+    vec3 tvec = ray.origin - v0;
+    float u = dot(tvec, p) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 q = cross(tvec, e1);
+    float v = dot(ray.direction, q) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    t = dot(e2, q) * invDet;
+    if (t < 0.001) return false;
+    normal = normalize(cross(e1, e2));
+    if (dot(normal, ray.direction) > 0.0) normal = -normal;
+    return true;
+}
+
+bool hit_triangle(Triangle triangle, Ray ray, out vec3 normal, out float t) {
+    return intersectTriangle(ray, triangle.v0, triangle.v1, triangle.v2, t, normal);
+}
+
+bool hit_quad(Quad quad, Ray ray, out vec3 normal, out float t) {
+    // ray-quad intersection using two triangles
+    // quad is defined by point, v1, and v2
+    vec3 p0 = quad.point;
+    vec3 p1 = quad.point + quad.v1;
+    vec3 p2 = quad.point + quad.v2;
+    vec3 p3 = quad.point + quad.v1 + quad.v2;
+    float tTemp;
+    vec3 nTemp;
+    if (intersectTriangle(ray,p0,p1,p2,tTemp,nTemp)) { t = tTemp; normal = nTemp; return true; }
+    if (intersectTriangle(ray,p3,p2,p1,tTemp,nTemp)) { t = tTemp; normal = nTemp; return true; }
+    return false;
+}
+
+// returns true if ray hits the box [minB, maxB] at any t ≥ 0
+bool hitAABB(vec3 minB, vec3 maxB, Ray ray) {
+    vec3 invD = 1.0 / ray.direction;
+    vec3 t0s  = (minB - ray.origin) * invD;
+    vec3 t1s  = (maxB - ray.origin) * invD;
+
+    // component‐wise min/max
+    vec3 tsmaller = min(t0s, t1s);
+    vec3 tbigger  = max(t0s, t1s);
+
+    // the latest entry time:
+    float tmin = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
+    // the earliest exit time:
+    float tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
+
+    // hit if the intervals overlap and exit is after entry
+    return (tmax >= max(tmin, 0.0));
+}
+
+// -------------------------------------------
+// Compute Shader Entry Point
+// -------------------------------------------
+layout(rgba32f, binding=0) uniform image2D imgOut;
+layout(rgba32f, binding=1) uniform readonly image2D imgAccum;
+layout(std430, binding = 4) buffer TriangleBuffer {
+    Triangle triangles[];
+};
+
+uniform float iTime;
+uniform int frameCount;
+uniform vec3 cameraPos;
+uniform vec3 cameraRight;
+uniform vec3 cameraUp;
+uniform vec3 cameraForward;
+uniform int NUM_TRIANGLES;
+uniform vec3 meshMin;
+uniform vec3 meshMax;
+
+layout(local_size_x=16, local_size_y=16) in;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = imageSize(imgOut);
+    float aspect = float(size.x) / float(size.y);
+
+    // seed RNG per pixel+frame
+    uint rngState = uint(pixel.x)
+                  + uint(pixel.y)*uint(size.x)
+                  + uint(frameCount)*uint(size.x)*uint(size.y);
+
+    // Scene: Cornell box + two spheres
+    Sphere spheres[2] = Sphere[2](
+        Sphere(vec3(-0.4,-0.7,0.4), 0.3, 0, vec3(0.8,0.6,0.2), vec3(0.0),0.0),
+        Sphere(vec3(0.4,-0.7,-0.4), 0.3, 1, vec3(1.0), vec3(0.0),0.0)
+    );
+    Quad quads[7] = Quad[7](
+        Quad(vec3(-1,-1,-1), vec3(2,0,0), vec3(0,2,0), 0,vec3(0.73), vec3(0.0), 0.0),
+        Quad(vec3(-1,-1,-1), vec3(2,0,0), vec3(0,0,2), 0,vec3(0.73), vec3(0.0), 0.0),
+        Quad(vec3(-1,1,-1), vec3(2,0,0), vec3(0,0,2), 0,vec3(0.73), vec3(0.0), 0.0),
+        Quad(vec3(-1,-1,-1), vec3(0,2,0), vec3(0,0,2), 1,vec3(0.65,0.05,0.05), vec3(0.0), 0.0),
+        Quad(vec3(1,-1,-1), vec3(0,0,2), vec3(0,2,0), 1,vec3(0.12,0.45,0.15), vec3(0.0), 0.0),
+        Quad(vec3(-0.25,0.999,-0.25), vec3(0.5,0,0),vec3(0,0,0.5), 0, vec3(1.0), vec3(1.0), 8.0),
+        Quad(vec3(-1,-1,1), vec3(2,0,0), vec3(0,2,0), 0, vec3(0.0,0.5,0.5), vec3(0.0), 0.0)
+    );
+
+    vec3 total_col = vec3(0.0);
+    const int MAX_SAMPLES = 40;
+    const int MAX_BOUNCES = 10;
+
+    for(int i=0; i<MAX_SAMPLES; ++i) {
+        // pixel jitter
+        float u = (float(pixel.x)/float(size.x))*2.0 - 1.0;
+        float v = (float(pixel.y)/float(size.y))*2.0 - 1.0;
+        u *= aspect;
+        vec2 lens = RandomPointInCircle(rngState);
+        u += lens.x/float(size.x);
+        v += lens.y/float(size.y);
+
+        vec3 dir = normalize(u*cameraRight + v*cameraUp + cameraForward);
+        Ray ray = Ray(cameraPos, dir);
+        vec3 throughput = vec3(1.0);
+        vec3 col = vec3(0.0);
+
+        for(int b=0; b < MAX_BOUNCES; ++b) {
+            float closestT = 1e20;
+            vec3 normal;
+            int mat = -1;
+            vec3 color;
+            vec3 emission;
+            float emitStr;
+
+            // spheres
+            /*
+            for(int s=0; s<2; ++s) {
+                float tTemp;
+                vec3 nTemp;
+                if(hit_sphere(spheres[s], ray, nTemp, tTemp) && tTemp < closestT) {
+                    closestT = tTemp;
+                    normal = nTemp;
+                    mat = spheres[s].material;
+                    color = spheres[s].color;
+                    emission = spheres[s].emission;
+                    emitStr = spheres[s].emissionStrength;
+                }
+            }
+            */
+            // quads
+            for(int q=0; q<7; ++q) {
+                float tTemp;
+                vec3 nTemp;
+                if(hit_quad(quads[q], ray, nTemp, tTemp) && tTemp < closestT) {
+                    closestT = tTemp;
+                    normal = nTemp;
+                    mat = quads[q].material;
+                    color = quads[q].color;
+                    emission = quads[q].emission;
+                    emitStr = quads[q].emissionStrength;
+                }
+            }
+
+            // triangles are stored in a buffer object
+            if (hitAABB(meshMin, meshMax, ray)) {
+                for (int i = 0; i < NUM_TRIANGLES; ++i) {
+
+                    float tTemp;
+                    vec3 nTemp;
+                    if (hit_triangle(triangles[i], ray, nTemp, tTemp) && tTemp < closestT) {
+                        closestT = tTemp;
+                        normal = nTemp;
+                        mat = triangles[i].material;
+                        color = triangles[i].color;
+                        emission = triangles[i].emission;
+                        emitStr = triangles[i].emissionStrength;
+                    }
+                }
+            }
+
+            if(mat<0) break;
+
+            vec3 hitPt = ray.origin + closestT*ray.direction;
+            col += emission*emitStr*throughput;
+            if(emitStr>0.0) break;
+            throughput *= sqrt(color); // sqrt for gamma correction
+            vec3 newDir;
+            if(mat == 0) {
+                newDir = scatter_diffuse(normal, rngState);
+            } else if(mat == 1) {
+                newDir = scatter_specular(normal, ray.direction);
+            } else {
+                bool refr;
+                newDir = scatter_glass(normal, ray.direction, 1.0/1.33, rngState, refr);
+            }
+            ray = Ray(hitPt + 0.001*normal, newDir);
+        }
+        total_col += col;
+    }
+
+    vec3 averaged = total_col / float(MAX_SAMPLES); // average over samples
+    vec4 prev = imageLoad(imgAccum, pixel);
+    vec4 result = mix(prev, vec4(averaged,1.0), 1.0/float(frameCount+1)); // blend with previous frame
+    imageStore(imgOut, pixel, result);
+}
